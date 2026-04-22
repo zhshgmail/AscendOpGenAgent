@@ -13,16 +13,12 @@ class Model(nn.Module):
     def forward(self, grad_output: torch.Tensor, alpha: float, scale: float, input_scale: float, is_result: bool, self_or_result: torch.Tensor) -> torch.Tensor:
         mask = self_or_result <= 0
         if is_result:
-            grad_output = grad_output.clone()
-            grad_output[mask] *= input_scale * (self_or_result[mask] + alpha * scale)
-            grad_output[~mask] *= scale
-            return grad_output
+            factor = torch.where(mask, input_scale * (self_or_result + alpha * scale), scale)
+            return grad_output * factor
         else:
-            grad_output = grad_output.clone()
-            exp_values = torch.exp(self_or_result[mask] * input_scale)
-            grad_output[mask] *= input_scale * alpha * scale * exp_values
-            grad_output[~mask] *= scale
-            return grad_output
+            tmp = torch.exp(self_or_result * input_scale)
+            factor = torch.where(mask, input_scale * alpha * scale * tmp, scale)
+            return grad_output * factor
 
 
 def get_input_groups():
