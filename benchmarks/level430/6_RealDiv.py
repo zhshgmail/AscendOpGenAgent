@@ -1,14 +1,14 @@
-import torch
-import torch.nn as nn
-import json
-import os
-
 import tensorflow as tf
 
 try:
     tf.compat.v1.disable_eager_execution()
 except RuntimeError:
     pass
+
+import torch
+import torch.nn as nn
+import json
+import os
 
 
 class Model(nn.Module):
