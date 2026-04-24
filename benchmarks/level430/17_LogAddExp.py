@@ -22,7 +22,19 @@ class Model(nn.Module):
         Returns:
             torch.Tensor: Output tensor.
         """
-        return torch.logaddexp(x, y)
+        x_is_f64 = x.dtype == torch.float64
+        y_is_f64 = y.dtype == torch.float64
+        if not (x_is_f64 or y_is_f64):
+            return torch.logaddexp(x, y)
+
+        if x_is_f64 and y_is_f64:
+            out_dtype = torch.float32
+        else:
+            out_dtype = y.dtype if x_is_f64 else x.dtype
+        out_shape = torch.broadcast_shapes(x.shape, y.shape)
+        result = torch.empty(out_shape, dtype=out_dtype, device=x.device)
+        torch.logaddexp(x, y, out=result)
+        return result
 
 
 def get_input_groups():
