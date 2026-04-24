@@ -43,8 +43,8 @@ class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
 
-    def forward(self, input_tokens: torch.Tensor, sampled_token_ids: torch.Tensor, 
-                input_positions: torch.Tensor, seq_lens: torch.Tensor, 
+    def forward(self, input_tokens: torch.Tensor, sampled_token_ids: torch.Tensor,
+                input_positions: torch.Tensor, seq_lens: torch.Tensor,
                 slot_mapping: torch.Tensor, block_tables: torch.Tensor,
                 num_seqs: int, num_queries: int, block_size: int) -> None:
         """
@@ -70,9 +70,31 @@ class Model(nn.Module):
         Returns:
             None: This operation is in-place.
         """
-        return torch_npu.npu_advance_step_flashattn(input_tokens, sampled_token_ids, input_positions, 
-                                                     seq_lens, slot_mapping, block_tables, 
-                                                     num_seqs, num_queries, block_size)
+        # Fast path: torch_npu fused op (registered on Ascend910b / Ascend910_93).
+        # Fallback: pure-PyTorch impl mirroring the docstring algorithm — covers
+        # SOCs where the op is unregistered (e.g. Ascend950PR_9589 → CANN err 161001
+        # "operator not compiled for this SOC", and the kernel def_cpp only adds
+        # ascend910b / ascend910_93 configs). See OL-68 in a5_ops OPERATIONAL_KNOWLEDGE.md.
+        try:
+            return torch_npu.npu_advance_step_flashattn(input_tokens, sampled_token_ids, input_positions,
+                                                         seq_lens, slot_mapping, block_tables,
+                                                         num_seqs, num_queries, block_size)
+        except RuntimeError:
+            # In-place pure-PyTorch reference (matches the docstring algorithm above).
+            if sampled_token_ids.dim() == 2:
+                input_tokens[:num_queries] = sampled_token_ids.squeeze(-1)
+            else:
+                input_tokens[:num_queries] = sampled_token_ids
+            seq_lens[:num_queries] += 1
+            input_positions[:num_queries] = seq_lens[:num_queries] - 1
+            for i in range(num_queries):
+                seq_len = int(seq_lens[i].item())
+                block_idx = (seq_len - 1) // block_size
+                block_offset = (seq_len - 1) % block_size
+                if block_idx < block_tables.size(1):
+                    physical_block = block_tables[i, block_idx]
+                    slot_mapping[i] = physical_block * block_size + block_offset
+            return None
 
 
 def get_input_groups():
