@@ -1,17 +1,64 @@
 #!/usr/bin/env python3
 """算子验证脚本 — 对比框架实现 (Model) 与生成实现 (ModelNew) 的输出一致性。
 
+多 shape 模式下：每个 shape 独立 try/except，全部跑完后落盘 verify_result.json。
+策略 A：passed < total 即整体判失败（exit 1），同时失败清单记录在 JSON 的 `failures` 字段。
+
 用法:
     python verify.py --op_name <算子名> [--verify_dir <验证目录>] [--timeout <超时秒数>]
-
-前置条件（验证目录下需存在以下文件）:
-    {op_name}_torch.py            — 包含 Model, get_inputs, get_init_inputs
-    {op_name}_triton_ascend_impl.py — 包含 ModelNew
 """
 import argparse
+import gc
+import json
 import os
 import sys
 import subprocess
+import traceback
+
+
+ERROR_MSG_LIMIT = 2000
+
+
+def truncate_error(msg: str, limit: int = ERROR_MSG_LIMIT) -> str:
+    if msg is None:
+        return ""
+    if len(msg) <= limit:
+        return msg
+    half = limit // 2
+    return f"{msg[:half]}\n... [truncated {len(msg) - limit} chars] ...\n{msg[-half:]}"
+
+
+def describe_input(inputs):
+    """输入列表的结构化描述（用于 JSON）。"""
+    try:
+        import torch
+    except Exception:
+        torch = None
+    descs = []
+    for x in inputs:
+        if torch is not None and isinstance(x, torch.Tensor):
+            descs.append({
+                "type": "tensor",
+                "shape": list(x.shape),
+                "dtype": str(x.dtype),
+            })
+        else:
+            try:
+                val = x if isinstance(x, (int, float, bool, str)) else repr(x)
+            except Exception:
+                val = "<unrepr>"
+            descs.append({"type": "scalar", "value": val})
+    return descs
+
+
+def cleanup_npu_memory():
+    try:
+        import torch
+        import torch_npu  # noqa: F401
+        torch.npu.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
 
 
 def get_limit(data_type):
@@ -71,23 +118,11 @@ def get_limit(data_type):
 
 
 def resolve_input_provider(torch_module):
-    """解析任务文件的输入提供方式。
-
-    支持两种格式：
-        - get_inputs(): 旧格式，返回单组输入
-        - get_input_groups(): 新格式，返回多组输入列表
-
-    Returns:
-        (input_groups, total_cases)
-        - input_groups: 输入组列表
-        - total_cases: 测试用例总数
-    """
+    """解析任务文件的输入提供方式。"""
     if hasattr(torch_module, "get_input_groups"):
-        # 新格式：多组输入（如 26_GELU_.py 有 51 组 shape 用例）
         groups = torch_module.get_input_groups()
         return groups, len(groups)
     elif hasattr(torch_module, "get_inputs"):
-        # 旧格式：单组输入（保持向后兼容）
         return [torch_module.get_inputs()], 1
     else:
         raise AttributeError(
@@ -226,52 +261,35 @@ def run_single_case(
     case_idx,
     total_cases
 ):
-    """验证单组输入。
-
-    注意: 此函数依赖 torch，应在已导入 torch 的上下文中调用，
-    或由 verify_implementations() 调用（该函数会导入 torch）。
-
-    Args:
-        framework_model: 参考实现模型
-        impl_model: 生成的实现模型
-        inputs: 输入张量/参数列表
-        device: NPU 设备
-        case_idx: 当前用例序号（从1开始）
-        total_cases: 总用例数
-    """
-    import torch  # 延迟导入：确保 torch 在此作用域可用
+    """验证单组输入。失败时抛出 AssertionError。"""
+    import torch
 
     print(f"  测试第 {case_idx}/{total_cases} 组输入...", file=sys.stderr)
 
-    # 将输入移至设备
     inputs_for_impl = [
-        x.to(device) if isinstance(x, torch.Tensor) else x 
+        x.to(device) if isinstance(x, torch.Tensor) else x
         for x in inputs
     ]
     inputs_for_framework = [
-        x.to(device) if isinstance(x, torch.Tensor) else x 
+        x.to(device) if isinstance(x, torch.Tensor) else x
         for x in inputs
     ]
 
-    # 前向推理
     with torch.no_grad():
         impl_output = impl_model(*inputs_for_impl)
         framework_output = framework_model(*inputs_for_framework)
 
-    # 标准化输出格式
     if not isinstance(framework_output, (list, tuple)):
         framework_output = [framework_output]
     if not isinstance(impl_output, (list, tuple)):
         impl_output = [impl_output]
 
-    # 验证输出数量
     if len(framework_output) != len(impl_output):
         raise AssertionError(
             f"[用例 {case_idx}/{total_cases}] 输出数量不一致: "
             f"framework={len(framework_output)}, impl={len(impl_output)}"
         )
 
-    # 比较每个输出
     for i, (fw_out, impl_out) in enumerate(zip(framework_output, impl_output)):
         if fw_out is None or impl_out is None:
             raise AssertionError(
@@ -286,14 +304,19 @@ def run_single_case(
                 raise AssertionError(f"[用例 {case_idx}/{total_cases}] {str(e)}") from e
 
 
-def verify_implementations(op_name, verify_dir, triton_impl_name="triton_ascend_impl"):
-    """验证框架实现和生成实现的结果一致性，支持多组输入验证。"""
+def verify_implementations(op_name, verify_dir, triton_impl_name="triton_ascend_impl", output_path=None):
+    """验证框架实现和生成实现的结果一致性。
+
+    每个 shape 独立 try/except，全部跑完后写 verify_result.json。
+
+    Returns:
+        (passed_cases, total_cases)
+    """
     import torch
     import torch_npu  # noqa: F401
-    
+
     sys.path.insert(0, verify_dir)
 
-    # 加载模块
     torch_module = __import__(f"{op_name}_torch")
     impl_module = __import__(f"{op_name}_{triton_impl_name}")
 
@@ -301,34 +324,74 @@ def verify_implementations(op_name, verify_dir, triton_impl_name="triton_ascend_
     ModelNew = impl_module.ModelNew
     get_init_inputs = torch_module.get_init_inputs
 
-    # 解析输入（支持 get_inputs 或 get_input_groups 格式）
     input_groups, total_cases = resolve_input_provider(torch_module)
-    
+
     device = torch.device("npu")
-    init_params = get_init_inputs()
 
-    # 对每组输入进行验证
+    failures = []
+    passed_cases = 0
+
     for case_idx, inputs in enumerate(input_groups, start=1):
-        # 创建模型（确保权重一致）
-        torch.manual_seed(0)
-        torch.npu.manual_seed(0)
-        framework_model = FrameworkModel(*init_params).to(device)
+        input_desc = describe_input(inputs)
+        framework_model = None
+        impl_model = None
+        try:
+            init_params = get_init_inputs()
+            torch.manual_seed(0)
+            torch.npu.manual_seed(0)
+            framework_model = FrameworkModel(*init_params).to(device)
 
-        torch.manual_seed(0)
-        torch.npu.manual_seed(0)
-        impl_model = ModelNew(*init_params).to(device)
+            torch.manual_seed(0)
+            torch.npu.manual_seed(0)
+            impl_model = ModelNew(*init_params).to(device)
 
-        # 验证该组输入
-        run_single_case(
-            framework_model, 
-            impl_model, 
-            inputs, 
-            device, 
-            case_idx, 
-            total_cases
+            run_single_case(
+                framework_model, impl_model, inputs, device, case_idx, total_cases
+            )
+            passed_cases += 1
+        except Exception as e:
+            err_detail = traceback.format_exc()
+            print(f"  [用例 {case_idx}/{total_cases}] 失败: {type(e).__name__}: {e}", file=sys.stderr)
+            failures.append({
+                "case_idx": case_idx,
+                "input_desc": input_desc,
+                "error_type": type(e).__name__,
+                "error_msg": truncate_error(err_detail),
+            })
+        finally:
+            del framework_model
+            del impl_model
+            cleanup_npu_memory()
+
+    failed_cases = total_cases - passed_cases
+
+    # 落盘 verify_result.json
+    if output_path is None:
+        output_path = os.path.join(verify_dir, "verify_result.json")
+    result = {
+        "op_name": op_name,
+        "total_cases": total_cases,
+        "passed_cases": passed_cases,
+        "failed_cases": failed_cases,
+        "failures": failures,
+    }
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        print(f"验证结果已保存到: {output_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"警告: 无法写入 verify_result.json: {e}", file=sys.stderr)
+
+    if failed_cases == 0:
+        print(f"验证成功：共 {total_cases} 组测试用例全部通过")
+    else:
+        print(
+            f"验证失败：{passed_cases}/{total_cases} 组通过，"
+            f"{failed_cases} 组失败（详见 {output_path}）",
+            file=sys.stderr,
         )
 
-    print(f"验证成功：共 {total_cases} 组测试用例通过")
+    return passed_cases, total_cases
 
 
 if __name__ == "__main__":
@@ -344,6 +407,10 @@ if __name__ == "__main__":
         help="Triton 实现模块名（不含 op_name 前缀，默认 triton_ascend_impl）",
     )
     parser.add_argument(
+        "--output", default=None,
+        help="验证结果 JSON 输出路径（默认 {verify_dir}/verify_result.json）",
+    )
+    parser.add_argument(
         "--_run", action="store_true",
         help=argparse.SUPPRESS,  # 内部参数：子进程模式，直接执行验证
     )
@@ -357,10 +424,15 @@ if __name__ == "__main__":
     if args._run:
         # 子进程模式：直接执行验证逻辑
         try:
-            verify_implementations(args.op_name, verify_dir, args.triton_impl_name)
+            passed, total = verify_implementations(
+                args.op_name, verify_dir, args.triton_impl_name, args.output
+            )
         except Exception as e:
             print(f"{e}", file=sys.stderr)
+            traceback.print_exc()
             sys.exit(1)
+        # 策略 A：passed < total → exit 1
+        sys.exit(0 if passed == total and total > 0 else 1)
     else:
         # 主进程模式：启动子进程执行验证，超时后 kill 整个进程树
         cmd = [
@@ -370,6 +442,8 @@ if __name__ == "__main__":
             "--triton_impl_name", args.triton_impl_name,
             "--_run",
         ]
+        if args.output:
+            cmd.extend(["--output", args.output])
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -380,10 +454,9 @@ if __name__ == "__main__":
 
             sys.stdout.buffer.write(stdout)
             sys.stdout.buffer.flush()
-            if proc.returncode != 0:
-                sys.stderr.buffer.write(stderr)
-                sys.stderr.buffer.flush()
-                sys.exit(proc.returncode)
+            sys.stderr.buffer.write(stderr)
+            sys.stderr.buffer.flush()
+            sys.exit(proc.returncode)
 
         except subprocess.TimeoutExpired:
             proc.kill()

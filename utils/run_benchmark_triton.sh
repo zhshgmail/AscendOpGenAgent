@@ -22,6 +22,7 @@ IDS=""
 NPU_ID=0
 NPU_LIST=""
 OUTPUT_DIR=""
+ARCH="ascend910b2"
 
 # ── 参数解析 ──
 while [[ $# -gt 0 ]]; do
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
         --npu)           NPU_ID="$2"; shift 2 ;;
         --npu-list)      NPU_LIST="$2"; shift 2 ;;
         --output)        OUTPUT_DIR="$2"; shift 2 ;;
+        --arch)          ARCH="$2"; shift 2 ;;
         -h|--help)
             echo "用法: bash utils/run_benchmark_triton.sh --benchmark-dir <path> --level <N> [--range <start-end> | --ids <id_list>] [--npu <id> | --npu-list <list>] --output <path>"
             echo ""
@@ -44,6 +46,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --npu            单 NPU 设备 ID，如 0 (默认 0，与 --npu-list 互斥)"
             echo "  --npu-list       多 NPU 列表，逗号分隔，如 0,1,2,3,4,5 (与 --npu 互斥，优先级更高)"
             echo "  --output         输出目录 (必填)"
+            echo "  --arch           目标设备架构，默认 ascend910b2"
             echo ""
             echo "示例:"
             echo "  # 单 NPU 串行模式"
@@ -142,6 +145,7 @@ echo "# 批量执行报告" > "$REPORT_FILE"
 echo "" >> "$REPORT_FILE"
 echo "- benchmark: ${BENCHMARK_DIR}" >> "$REPORT_FILE"
 echo "- level: ${LEVEL}" >> "$REPORT_FILE"
+echo "- arch: ${ARCH}" >> "$REPORT_FILE"
 if [[ "$USE_PARALLEL" == true ]]; then
     echo "- npu-list: ${NPU_LIST}" >> "$REPORT_FILE"
     echo "- 执行模式: 多 NPU 并行（NPU 间并行，NPU 内串行）" >> "$REPORT_FILE"
@@ -190,15 +194,20 @@ if [[ "$USE_PARALLEL" == true ]]; then
                     filename=$(basename "$file")
                     op_name="${filename%.*}"
                     TARGET_OP_DIR="${OUTPUT_DIR}/${op_name}"
+                    json_file="${file%.py}.json"
 
                     mkdir -p "$TARGET_OP_DIR"
 
                     START_TIME=$(date +%s)
 
-                    PROMPT="使用当前agent及其subagent工作流生成、验证并评测triton-ascend算子，npu=${npu}，算子描述文件为 ${file}，输出到 ${TARGET_OP_DIR}/"
+                    if [[ -f "$json_file" ]]; then
+                        PROMPT="生成一个基于 Triton-Ascend 框架的算子，参考${file}和${json_file}。目标设备架构为${ARCH}，使用NPU=${npu}，请将生成的代码文件输出至${TARGET_OP_DIR}/目录下。"
+                    else
+                        PROMPT="生成一个基于 Triton-Ascend 框架的算子，参考${file}。目标设备架构为${ARCH}，使用NPU=${npu}，请将生成的代码文件输出至${TARGET_OP_DIR}/目录下。"
+                    fi
 
                     if claude -p "$PROMPT" \
-                        --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)' 'Agent(*)' \
+                        --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)' \
                         >> "${OUTPUT_DIR}/npu_${npu}.log" 2>&1; then
 
                         END_TIME=$(date +%s)
@@ -213,6 +222,7 @@ if [[ "$USE_PARALLEL" == true ]]; then
                             echo "| ${id} | ${filename} | ✅ 成功 | ${ELAPSED} |" >> "$REPORT_FILE"
                         } 200>"${OUTPUT_DIR}/.lock"
 
+                        STATUS="success"
                     else
                         END_TIME=$(date +%s)
                         ELAPSED=$((END_TIME - START_TIME))
@@ -225,7 +235,23 @@ if [[ "$USE_PARALLEL" == true ]]; then
                             flock -x 200
                             echo "| ${id} | ${filename} | ❌ 失败 | ${ELAPSED} |" >> "$REPORT_FILE"
                         } 200>"${OUTPUT_DIR}/.lock"
+
+                        STATUS="fail"
                     fi
+
+                    # 串行重命名思维轨迹文件（带时间戳防止同名覆盖）
+                    {
+                        flock -x 201
+                        LATEST_JSONL=$(ls -t "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)
+                        if [[ -n "$LATEST_JSONL" && -f "$LATEST_JSONL" ]]; then
+                            BASENAME=$(basename "$LATEST_JSONL" .jsonl)
+                            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                            mv "$LATEST_JSONL" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}.jsonl"
+                            if [[ -d "${CLAUDE_PROJECT_DIR}/${BASENAME}" ]]; then
+                                mv "${CLAUDE_PROJECT_DIR}/${BASENAME}" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}"
+                            fi
+                        fi
+                    } 201>"${OUTPUT_DIR}/.trace_lock"
                 done
                 # ========== Worker 进程结束 ==========
             ) &
@@ -249,6 +275,7 @@ else
         filename=$(basename "$file")
         op_name="${filename%.*}"
         TARGET_OP_DIR="${OUTPUT_DIR}/${op_name}"
+        json_file="${file%.py}.json"
 
         mkdir -p "$TARGET_OP_DIR"
 
@@ -261,21 +288,38 @@ else
 
         START_TIME=$(date +%s)
 
-        PROMPT="使用当前agent及其subagent工作流生成、验证并评测triton-ascend算子，npu=${NPU_ID}，算子描述文件为 ${file}，输出到 ${TARGET_OP_DIR}/"
+        if [[ -f "$json_file" ]]; then
+            PROMPT="生成一个基于 Triton-Ascend 框架的算子，参考${file}和${json_file}。目标设备架构为${ARCH}，使用NPU=${NPU_ID}，请将生成的代码文件输出至${TARGET_OP_DIR}/目录下。"
+        else
+            PROMPT="生成一个基于 Triton-Ascend 框架的算子，参考${file}。目标设备架构为${ARCH}，使用NPU=${NPU_ID}，请将生成的代码文件输出至${TARGET_OP_DIR}/目录下。"
+        fi
 
         if claude -p "$PROMPT" \
-            --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)' 'Agent(*)'; then
+            --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)'; then
             END_TIME=$(date +%s)
             ELAPSED=$((END_TIME - START_TIME))
             echo "| ${id} | ${filename} | ✅ 成功 | ${ELAPSED} |" >> "$REPORT_FILE"
             SUCCESS=$((SUCCESS + 1))
             echo "[${CURRENT}/${TOTAL}] ✅ 算子 ${id} 完成 (${ELAPSED}s)"
+            STATUS="success"
         else
             END_TIME=$(date +%s)
             ELAPSED=$((END_TIME - START_TIME))
             echo "| ${id} | ${filename} | ❌ 失败 | ${ELAPSED} |" >> "$REPORT_FILE"
             FAIL=$((FAIL + 1))
             echo "[${CURRENT}/${TOTAL}] ❌ 算子 ${id} 失败 (${ELAPSED}s)"
+            STATUS="fail"
+        fi
+
+        # 重命名思维轨迹文件（带时间戳防止同名覆盖）
+        LATEST_JSONL=$(ls -t "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)
+        if [[ -n "$LATEST_JSONL" && -f "$LATEST_JSONL" ]]; then
+            BASENAME=$(basename "$LATEST_JSONL" .jsonl)
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            mv "$LATEST_JSONL" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}.jsonl"
+            if [[ -d "${CLAUDE_PROJECT_DIR}/${BASENAME}" ]]; then
+                mv "${CLAUDE_PROJECT_DIR}/${BASENAME}" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}"
+            fi
         fi
     done
 fi
@@ -307,4 +351,5 @@ if [[ "$USE_PARALLEL" == true ]]; then
     echo "NPU 日志目录: ${OUTPUT_DIR}/"
 fi
 echo "================================================================"
+
 
