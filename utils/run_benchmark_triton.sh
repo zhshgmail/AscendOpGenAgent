@@ -195,15 +195,10 @@ if [[ "$USE_PARALLEL" == true ]]; then
 
                     START_TIME=$(date +%s)
 
-                    # 动态计算当前项目的 Claude 思维轨迹目录
-                    CWD=$(pwd)
-                    CLAUDE_PROJECT_NAME=$(echo "$CWD" | sed 's|/|-|g')
-                    CLAUDE_PROJECT_DIR="$HOME/.claude/projects/$CLAUDE_PROJECT_NAME"
-
-                    PROMPT="使用当前agent生成triton-ascend算子，npu=${npu}，算子描述文件为 ${file}，输出到 ${TARGET_OP_DIR}/"
+                    PROMPT="使用当前agent及其subagent工作流生成、验证并评测triton-ascend算子，npu=${npu}，算子描述文件为 ${file}，输出到 ${TARGET_OP_DIR}/"
 
                     if claude -p "$PROMPT" \
-                        --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)' \
+                        --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)' 'Agent(*)' \
                         >> "${OUTPUT_DIR}/npu_${npu}.log" 2>&1; then
 
                         END_TIME=$(date +%s)
@@ -218,7 +213,6 @@ if [[ "$USE_PARALLEL" == true ]]; then
                             echo "| ${id} | ${filename} | ✅ 成功 | ${ELAPSED} |" >> "$REPORT_FILE"
                         } 200>"${OUTPUT_DIR}/.lock"
 
-                        STATUS="success"
                     else
                         END_TIME=$(date +%s)
                         ELAPSED=$((END_TIME - START_TIME))
@@ -231,23 +225,7 @@ if [[ "$USE_PARALLEL" == true ]]; then
                             flock -x 200
                             echo "| ${id} | ${filename} | ❌ 失败 | ${ELAPSED} |" >> "$REPORT_FILE"
                         } 200>"${OUTPUT_DIR}/.lock"
-
-                        STATUS="fail"
                     fi
-
-                    # 串行重命名思维轨迹文件（带时间戳防止同名覆盖）
-                    {
-                        flock -x 201
-                        LATEST_JSONL=$(ls -t "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)
-                        if [[ -n "$LATEST_JSONL" && -f "$LATEST_JSONL" ]]; then
-                            BASENAME=$(basename "$LATEST_JSONL" .jsonl)
-                            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-                            mv "$LATEST_JSONL" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}.jsonl"
-                            if [[ -d "${CLAUDE_PROJECT_DIR}/${BASENAME}" ]]; then
-                                mv "${CLAUDE_PROJECT_DIR}/${BASENAME}" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}"
-                            fi
-                        fi
-                    } 201>"${OUTPUT_DIR}/.trace_lock"
                 done
                 # ========== Worker 进程结束 ==========
             ) &
@@ -283,39 +261,21 @@ else
 
         START_TIME=$(date +%s)
 
-        # 动态计算当前项目的 Claude 思维轨迹目录
-        CWD=$(pwd)
-        CLAUDE_PROJECT_NAME=$(echo "$CWD" | sed 's|/|-|g')
-        CLAUDE_PROJECT_DIR="$HOME/.claude/projects/$CLAUDE_PROJECT_NAME"
-
-        PROMPT="使用当前agent生成triton-ascend算子，npu=${NPU_ID}，算子描述文件为 ${file}，输出到 ${TARGET_OP_DIR}/"
+        PROMPT="使用当前agent及其subagent工作流生成、验证并评测triton-ascend算子，npu=${NPU_ID}，算子描述文件为 ${file}，输出到 ${TARGET_OP_DIR}/"
 
         if claude -p "$PROMPT" \
-            --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)'; then
+            --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)' 'Agent(*)'; then
             END_TIME=$(date +%s)
             ELAPSED=$((END_TIME - START_TIME))
             echo "| ${id} | ${filename} | ✅ 成功 | ${ELAPSED} |" >> "$REPORT_FILE"
             SUCCESS=$((SUCCESS + 1))
             echo "[${CURRENT}/${TOTAL}] ✅ 算子 ${id} 完成 (${ELAPSED}s)"
-            STATUS="success"
         else
             END_TIME=$(date +%s)
             ELAPSED=$((END_TIME - START_TIME))
             echo "| ${id} | ${filename} | ❌ 失败 | ${ELAPSED} |" >> "$REPORT_FILE"
             FAIL=$((FAIL + 1))
             echo "[${CURRENT}/${TOTAL}] ❌ 算子 ${id} 失败 (${ELAPSED}s)"
-            STATUS="fail"
-        fi
-
-        # 重命名思维轨迹文件（带时间戳防止同名覆盖）
-        LATEST_JSONL=$(ls -t "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)
-        if [[ -n "$LATEST_JSONL" && -f "$LATEST_JSONL" ]]; then
-            BASENAME=$(basename "$LATEST_JSONL" .jsonl)
-            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            mv "$LATEST_JSONL" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}.jsonl"
-            if [[ -d "${CLAUDE_PROJECT_DIR}/${BASENAME}" ]]; then
-                mv "${CLAUDE_PROJECT_DIR}/${BASENAME}" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}"
-            fi
         fi
     done
 fi
@@ -347,5 +307,4 @@ if [[ "$USE_PARALLEL" == true ]]; then
     echo "NPU 日志目录: ${OUTPUT_DIR}/"
 fi
 echo "================================================================"
-
 
