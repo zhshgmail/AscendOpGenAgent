@@ -3,6 +3,12 @@ import torch.nn as nn
 import json
 import os
 
+
+def _has_duplicate_indices(index: torch.Tensor) -> bool:
+    """True if the 1-D index tensor contains any duplicate value."""
+    return index.numel() != torch.unique(index).numel()
+
+
 class Model(nn.Module):
     """
     Simple model that puts values into a tensor at specified indices (1D case).
@@ -23,8 +29,40 @@ class Model(nn.Module):
 
         Returns:
             torch.Tensor: Tensor with values put at specified indices.
+
+        Determinism note (2026-04-27):
+            PyTorch documents `tensor.index_put_(indices, values, accumulate=False)`
+            on duplicate indices as **undefined behavior**. On Ascend950PR +
+            torch_npu 2.7.1, the NPU implementation is run-to-run non-deterministic
+            in this UB territory (probed: 14/17 large-K duplicate-index cases jitter
+            across 5 runs, max abs diff up to 5.2 fp16). This makes the NPU
+            reference unsuitable as a deterministic ground truth for verifier
+            bit-exact comparison: a deterministic kernel cannot match a moving
+            target.
+
+            For these UB cases, we fall back to a deterministic CPU for-loop
+            implementing the natural Python for-loop semantic
+            (`for k in range(K): x[idx[k]] = v[k]` — last-occurrence-wins).
+            This is a REFERENCE-side decision (the candidate kernel is still
+            evaluated against this deterministic reference); candidate kernels
+            MUST NOT use CPU fallback themselves — that would be reference-result
+            cheating.
+
+            The fallback applies only to the documented UB territory
+            (`accumulate=False` with duplicate indices). All other input shapes
+            use the NPU path unchanged.
         """
-        x.index_put_((index,), values, accumulate=accumulate)
+        if (not accumulate) and _has_duplicate_indices(index):
+            # Deterministic CPU fallback for PyTorch-UB region (see docstring).
+            orig_device = x.device
+            x_cpu = x.detach().cpu()
+            idx_cpu = index.detach().cpu().tolist()
+            val_cpu = values.detach().cpu()
+            for k in range(len(idx_cpu)):
+                x_cpu[idx_cpu[k]] = val_cpu[k]
+            x.copy_(x_cpu.to(orig_device))
+        else:
+            x.index_put_((index,), values, accumulate=accumulate)
         return x
 
 
